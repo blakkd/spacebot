@@ -27,6 +27,7 @@ pub mod tasks;
 #[cfg(feature = "metrics")]
 pub mod telemetry;
 pub mod tools;
+pub mod topics;
 pub mod update;
 
 pub use error::{Error, Result};
@@ -218,6 +219,7 @@ pub struct AgentDeps {
     pub llm_manager: Arc<llm::LlmManager>,
     pub mcp_manager: Arc<mcp::McpManager>,
     pub task_store: Arc<tasks::TaskStore>,
+    pub topic_store: Arc<topics::TopicStore>,
     pub cron_tool: Option<tools::CronTool>,
     pub runtime_config: Arc<config::RuntimeConfig>,
     pub event_tx: tokio::sync::broadcast::Sender<ProcessEvent>,
