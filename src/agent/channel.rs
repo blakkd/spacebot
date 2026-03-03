@@ -675,22 +675,25 @@ impl Channel {
 
         let identity_context = rc.identity.load().render();
 
-        // Use channel-specific topics if assigned, otherwise fall back to the global bulletin.
-        let channel_topics = self
+        let memory_bulletin = rc.memory_bulletin.load().to_string();
+
+        // List all active topics so the LLM can reference topic IDs when spawning workers.
+        let all_active_topics = self
             .deps
             .topic_store
-            .get_for_channel(&self.deps.agent_id, &self.id)
+            .list_active(&self.deps.agent_id)
             .await
             .unwrap_or_default();
-        let memory_bulletin = if channel_topics.is_empty() {
-            rc.memory_bulletin.load().to_string()
+        let available_topics = if all_active_topics.is_empty() {
+            String::new()
         } else {
-            channel_topics
-                .iter()
-                .filter(|topic| !topic.content.is_empty())
-                .map(|topic| format!("### {}\n\n{}", topic.title, topic.content))
-                .collect::<Vec<_>>()
-                .join("\n\n")
+            let mut section = String::from(
+                "\n## Available Topics\nYou can pass these topic IDs to `spawn_worker` via the `topic_ids` parameter for extra context:\n",
+            );
+            for topic in &all_active_topics {
+                section.push_str(&format!("- `{}`: {}\n", topic.id, topic.title));
+            }
+            section
         };
 
         let skills = rc.skills.load();
@@ -710,7 +713,9 @@ impl Channel {
         let current_time_line = temporal_context.current_time_line();
         let status_text = {
             let status = self.state.status_block.read().await;
-            status.render_with_time_context(Some(&current_time_line))
+            let mut rendered = status.render_with_time_context(Some(&current_time_line));
+            rendered.push_str(&available_topics);
+            rendered
         };
 
         // Render coalesce hint
@@ -1021,23 +1026,7 @@ impl Channel {
 
         let identity_context = rc.identity.load().render();
 
-        // Use channel-specific topics if assigned, otherwise fall back to the global bulletin.
-        let channel_topics = self
-            .deps
-            .topic_store
-            .get_for_channel(&self.deps.agent_id, &self.id)
-            .await
-            .unwrap_or_default();
-        let memory_bulletin = if channel_topics.is_empty() {
-            rc.memory_bulletin.load().to_string()
-        } else {
-            channel_topics
-                .iter()
-                .filter(|topic| !topic.content.is_empty())
-                .map(|topic| format!("### {}\n\n{}", topic.title, topic.content))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
+        let memory_bulletin = rc.memory_bulletin.load().to_string();
 
         // List all active topics so the LLM can reference topic IDs when spawning workers.
         let all_active_topics = self
@@ -1050,7 +1039,7 @@ impl Channel {
             String::new()
         } else {
             let mut section = String::from(
-                "\n## Available Topics\nYou can pass these topic IDs to `spawn_worker` via the `topic_ids` parameter:\n",
+                "\n## Available Topics\nYou can pass these topic IDs to `spawn_worker` via the `topic_ids` parameter for extra context:\n",
             );
             for topic in &all_active_topics {
                 section.push_str(&format!("- `{}`: {}\n", topic.id, topic.title));
