@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod hooks;
 pub mod identity;
+pub mod knowledge;
 pub mod links;
 pub mod llm;
 pub mod mcp;
