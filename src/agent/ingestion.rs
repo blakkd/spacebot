@@ -480,6 +480,7 @@ async fn process_chunk(
         deps.task_store.clone(),
         deps.memory_search.clone(),
         deps.runtime_config.clone(),
+        deps.mcp_manager.clone(),
         deps.memory_event_tx.clone(),
         conversation_logger,
         channel_store,
