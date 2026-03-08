@@ -86,8 +86,16 @@ pub(super) async fn set_authorized_key(
         }));
     }
 
-    // Validate it looks like an SSH public key
-    if !pubkey.starts_with("ssh-") && !pubkey.starts_with("ecdsa-") {
+    // Validate minimal SSH public key structure: "<type> <base64> [comment]"
+    let parts: Vec<&str> = pubkey.split_whitespace().collect();
+    let key_type = parts.first().copied().unwrap_or_default();
+    let key_body = parts.get(1).copied().unwrap_or_default();
+    let valid_type = key_type.starts_with("ssh-")
+        || key_type.starts_with("ecdsa-")
+        || key_type.starts_with("sk-ssh-")
+        || key_type.starts_with("sk-ecdsa-");
+    let valid_field_count = parts.len() == 2 || parts.len() == 3;
+    if !valid_type || !valid_field_count || key_body.is_empty() {
         return Ok(Json(SetAuthorizedKeyResponse {
             success: false,
             message: "Invalid SSH public key format".to_string(),
@@ -99,7 +107,7 @@ pub(super) async fn set_authorized_key(
         tracing::error!(%error, "failed to set SSH authorized key");
         return Ok(Json(SetAuthorizedKeyResponse {
             success: false,
-            message: format!("Failed to write authorized key: {error}"),
+            message: "Failed to write authorized key".to_string(),
         }));
     }
 
@@ -118,7 +126,7 @@ pub(super) async fn clear_authorized_keys(
         tracing::error!(%error, "failed to clear SSH authorized keys");
         return Ok(Json(SetAuthorizedKeyResponse {
             success: false,
-            message: format!("Failed to clear authorized keys: {error}"),
+            message: "Failed to clear authorized keys".to_string(),
         }));
     }
 

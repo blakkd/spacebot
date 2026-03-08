@@ -1387,6 +1387,17 @@ async fn run(
         None
     };
 
+    // Initialize SSH manager before HTTP server so /api/ssh/* endpoints have a
+    // registered manager from the moment the server starts accepting requests.
+    let ssh_manager = spacebot::ssh::SshManager::new(&config.instance_dir);
+    api_state.set_ssh_manager(ssh_manager).await;
+    if config.ssh.enabled {
+        let mut ssh = api_state.ssh_manager.lock().await;
+        if let Err(error) = ssh.start(config.ssh.port).await {
+            tracing::error!(%error, "failed to start sshd");
+        }
+    }
+
     let _http_handle = if config.api.enabled {
         // IPv6 addresses need brackets when combined with port: [::]:19898
         let raw_bind = config
@@ -1487,16 +1498,6 @@ async fn run(
     api_state.set_agent_links((**agent_links.load()).clone());
     api_state.set_agent_groups(config.groups.clone());
     api_state.set_agent_humans(config.humans.clone());
-
-    // Initialize SSH manager and start sshd if enabled
-    let ssh_manager = spacebot::ssh::SshManager::new(&config.instance_dir);
-    api_state.set_ssh_manager(ssh_manager).await;
-    if config.ssh.enabled {
-        let mut ssh = api_state.ssh_manager.lock().await;
-        if let Err(error) = ssh.start(config.ssh.port).await {
-            tracing::error!(%error, "failed to start sshd");
-        }
-    }
 
     // Track whether agents have been initialized
     let mut agents_initialized = false;

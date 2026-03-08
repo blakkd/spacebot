@@ -2014,8 +2014,8 @@ function SshSection({ settings, isLoading }: GlobalSettingsSectionProps) {
 				<div
 					className={`mt-4 rounded-md border px-3 py-2 text-sm ${
 						message.type === "success"
-							? "border-green-800 bg-green-950/50 text-green-400"
-							: "border-red-800 bg-red-950/50 text-red-400"
+							? "border-green-500/20 bg-green-500/10 text-green-400"
+							: "border-red-500/20 bg-red-500/10 text-red-400"
 					}`}
 				>
 					{message.text}

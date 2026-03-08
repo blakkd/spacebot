@@ -34,17 +34,12 @@ impl SshManager {
 
         // Generate host key if missing
         let host_key = self.ssh_dir.join("ssh_host_ed25519_key");
+        let host_key_str = host_key
+            .to_str()
+            .context("ssh host key path is not valid UTF-8")?;
         if !host_key.exists() {
             let output = Command::new("ssh-keygen")
-                .args([
-                    "-t",
-                    "ed25519",
-                    "-f",
-                    host_key.to_str().unwrap(),
-                    "-N",
-                    "",
-                    "-q",
-                ])
+                .args(["-t", "ed25519", "-f", host_key_str, "-N", "", "-q"])
                 .output()
                 .await
                 .context("failed to run ssh-keygen")?;
@@ -62,14 +57,19 @@ impl SshManager {
         }
 
         let authorized_keys = self.ssh_dir.join("authorized_keys");
+        let authorized_keys_str = authorized_keys
+            .to_str()
+            .context("authorized_keys path is not valid UTF-8")?;
+        let authorized_keys_option = format!("AuthorizedKeysFile={authorized_keys_str}");
+        let port_option = format!("Port={port}");
         let child = Command::new("/usr/sbin/sshd")
             .args([
                 "-D", // foreground
                 "-e", // log to stderr
                 "-h",
-                host_key.to_str().unwrap(),
+                host_key_str,
                 "-o",
-                &format!("Port={port}"),
+                &port_option,
                 "-o",
                 "PasswordAuthentication=no",
                 "-o",
@@ -77,7 +77,7 @@ impl SshManager {
                 "-o",
                 "PermitRootLogin=prohibit-password",
                 "-o",
-                &format!("AuthorizedKeysFile={}", authorized_keys.to_str().unwrap()),
+                &authorized_keys_option,
                 "-o",
                 "ListenAddress=[::]",
             ])

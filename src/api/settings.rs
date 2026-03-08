@@ -377,8 +377,8 @@ pub(super) async fn update_global_settings(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Start or stop sshd based on the new config
-    if request.ssh_enabled.is_some() {
+    // Apply SSH lifecycle changes when enabled or port is updated.
+    if request.ssh_enabled.is_some() || request.ssh_port.is_some() {
         let ssh_enabled = doc
             .get("ssh")
             .and_then(|s| s.get("enabled"))
@@ -393,11 +393,32 @@ pub(super) async fn update_global_settings(
 
         let mut ssh_manager = state.ssh_manager.lock().await;
         if ssh_enabled {
+            // Stop first so a port change takes effect on restart.
+            if ssh_manager.is_running() {
+                if let Err(error) = ssh_manager.stop().await {
+                    tracing::error!(%error, "failed to stop sshd before restart");
+                    return Ok(Json(GlobalSettingsUpdateResponse {
+                        success: false,
+                        message: "Failed to apply SSH settings".to_string(),
+                        requires_restart: false,
+                    }));
+                }
+            }
             if let Err(error) = ssh_manager.start(ssh_port).await {
                 tracing::error!(%error, "failed to start sshd after settings update");
+                return Ok(Json(GlobalSettingsUpdateResponse {
+                    success: false,
+                    message: "Failed to apply SSH settings".to_string(),
+                    requires_restart: false,
+                }));
             }
         } else if let Err(error) = ssh_manager.stop().await {
             tracing::error!(%error, "failed to stop sshd after settings update");
+            return Ok(Json(GlobalSettingsUpdateResponse {
+                success: false,
+                message: "Failed to apply SSH settings".to_string(),
+                requires_restart: false,
+            }));
         }
     }
 
