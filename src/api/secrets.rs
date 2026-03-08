@@ -4,6 +4,7 @@
 //! for the instance-level secret store. Secrets are global — shared across all
 //! agents in the instance.
 
+use super::admin::require_api_auth_token;
 use super::state::ApiState;
 use crate::config::{
     DefaultsConfig, DiscordConfig, EmailConfig, LlmConfig, SlackConfig, TelegramConfig,
@@ -488,6 +489,16 @@ pub async fn migrate_secrets(State(state): State<Arc<ApiState>>) -> impl IntoRes
 
 /// `POST /api/secrets/export` — Export all secrets as a JSON backup.
 pub async fn export_secrets(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    if let Err(status) = require_api_auth_token(&state).await {
+        return (
+            status,
+            Json(
+                serde_json::json!({"error": "api.auth_token must be configured to export secrets"}),
+            ),
+        )
+            .into_response();
+    }
+
     let store = match get_secrets_store(&state) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -756,5 +767,39 @@ fn set_instance_toml_value(
     };
     if let Some(instance) = instances.get_mut(index) {
         instance[key] = toml_edit::value(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_secrets;
+    use crate::api::ApiState;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use std::sync::Arc;
+
+    fn test_api_state() -> Arc<ApiState> {
+        let (provider_setup_tx, _provider_setup_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_tx, _agent_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_remove_tx, _agent_remove_rx) = tokio::sync::mpsc::channel(1);
+        let (injection_tx, _injection_rx) = tokio::sync::mpsc::channel(1);
+        let task_store_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        ));
+
+        Arc::new(ApiState::new_with_provider_sender(
+            provider_setup_tx,
+            agent_tx,
+            agent_remove_tx,
+            injection_tx,
+            task_store_registry,
+        ))
+    }
+
+    #[tokio::test]
+    async fn export_secrets_requires_configured_api_auth() {
+        let state = test_api_state();
+        let response = export_secrets(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
 }

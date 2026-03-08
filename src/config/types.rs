@@ -2328,6 +2328,27 @@ impl SystemSecrets for TwitchConfig {
     }
 }
 
+impl SystemSecrets for WebhookConfig {
+    fn section() -> &'static str {
+        "webhook"
+    }
+
+    fn is_messaging_adapter() -> bool {
+        true
+    }
+
+    fn secret_fields() -> &'static [SecretField] {
+        &[SecretField {
+            toml_key: "auth_token",
+            secret_name: "WEBHOOK_AUTH_TOKEN",
+            instance_pattern: Some(InstancePattern {
+                platform_prefix: "WEBHOOK",
+                field_suffix: "AUTH_TOKEN",
+            }),
+        }]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WebhookConfig {
     pub enabled: bool,

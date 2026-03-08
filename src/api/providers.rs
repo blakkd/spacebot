@@ -1,4 +1,6 @@
+use super::admin::{load_config_doc, reload_runtime_configs, secret_reference, write_config_doc};
 use super::state::ApiState;
+use crate::config::LlmConfig;
 use crate::openai_auth::DeviceTokenPollResult;
 
 use anyhow::Context as _;
@@ -314,22 +316,15 @@ async fn finalize_openai_oauth(
             .await;
     }
 
-    let config_path = state.config_path.read().await.clone();
-    let content = if config_path.exists() {
-        tokio::fs::read_to_string(&config_path)
-            .await
-            .context("failed to read config.toml")?
-    } else {
-        String::new()
-    };
-
-    let mut doc: toml_edit::DocumentMut = content.parse().context("failed to parse config.toml")?;
-    apply_model_routing(&mut doc, model);
-    tokio::fs::write(&config_path, doc.to_string())
+    let (_config_guard, config_path, mut doc) = load_config_doc(state)
         .await
-        .context("failed to write config.toml")?;
+        .map_err(|status| anyhow::anyhow!("failed to load config.toml: {status}"))?;
+    apply_model_routing(&mut doc, model);
+    write_config_doc(&config_path, &doc)
+        .await
+        .map_err(|status| anyhow::anyhow!("failed to write config.toml: {status}"))?;
 
-    // Refresh in-memory defaults so newly created agents inherit the updated routing.
+    let _ = reload_runtime_configs(state, &config_path).await;
     refresh_defaults_config(state).await;
 
     state
@@ -763,30 +758,24 @@ pub(super) async fn update_provider(
         }));
     }
 
-    let config_path = state.config_path.read().await.clone();
-
-    let content = if config_path.exists() {
-        tokio::fs::read_to_string(&config_path)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    } else {
-        String::new()
-    };
-
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let store = super::admin::secrets_store(&state)?;
+    let (_config_guard, config_path, mut doc) = load_config_doc(&state).await?;
 
     if doc.get("llm").is_none() {
         doc["llm"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
 
-    doc["llm"][key_name] = toml_edit::value(request.api_key);
+    if key_name == "ollama_base_url" {
+        doc["llm"][key_name] = toml_edit::value(request.api_key.trim());
+    } else {
+        let secret_ref =
+            secret_reference::<LlmConfig>(&store, key_name, None, request.api_key.trim())?;
+        doc["llm"][key_name] = toml_edit::value(secret_ref);
+    }
     apply_model_routing(&mut doc, normalized_model);
 
-    tokio::fs::write(&config_path, doc.to_string())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    write_config_doc(&config_path, &doc).await?;
+    let _ = reload_runtime_configs(&state, &config_path).await;
 
     // Refresh in-memory defaults so newly created agents inherit the updated routing.
     refresh_defaults_config(&state).await;
@@ -929,13 +918,7 @@ pub(super) async fn delete_provider(
         }));
     }
 
-    let content = tokio::fs::read_to_string(&config_path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (_config_guard, config_path, mut doc) = load_config_doc(&state).await?;
 
     if let Some(llm) = doc.get_mut("llm")
         && let Some(table) = llm.as_table_mut()
@@ -943,9 +926,8 @@ pub(super) async fn delete_provider(
         table.remove(key_name);
     }
 
-    tokio::fs::write(&config_path, doc.to_string())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    write_config_doc(&config_path, &doc).await?;
+    let _ = reload_runtime_configs(&state, &config_path).await;
 
     Ok(Json(ProviderUpdateResponse {
         success: true,
@@ -955,7 +937,11 @@ pub(super) async fn delete_provider(
 
 #[cfg(test)]
 mod tests {
-    use super::build_test_llm_config;
+    use super::{ProviderUpdateRequest, build_test_llm_config, update_provider};
+    use crate::api::ApiState;
+    use axum::Json;
+    use axum::extract::State;
+    use std::sync::Arc;
 
     #[test]
     fn build_test_llm_config_registers_ollama_provider_from_base_url() {
@@ -967,5 +953,61 @@ mod tests {
 
         assert_eq!(provider.base_url, "http://remote-ollama.local:11434");
         assert_eq!(provider.api_key, "");
+    }
+
+    fn test_api_state() -> Arc<ApiState> {
+        let (provider_setup_tx, _provider_setup_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_tx, _agent_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_remove_tx, _agent_remove_rx) = tokio::sync::mpsc::channel(1);
+        let (injection_tx, _injection_rx) = tokio::sync::mpsc::channel(1);
+        let task_store_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        ));
+
+        Arc::new(ApiState::new_with_provider_sender(
+            provider_setup_tx,
+            agent_tx,
+            agent_remove_tx,
+            injection_tx,
+            task_store_registry,
+        ))
+    }
+
+    #[tokio::test]
+    async fn update_provider_persists_secret_reference() {
+        let state = test_api_state();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        tokio::fs::write(&config_path, "\n")
+            .await
+            .expect("write config");
+        *state.config_path.write().await = config_path.clone();
+
+        let secrets_path = tempdir.path().join("secrets.redb");
+        let store =
+            Arc::new(crate::secrets::store::SecretsStore::new(&secrets_path).expect("secrets"));
+        state.set_secrets_store(store.clone());
+
+        let response = update_provider(
+            State(state),
+            Json(ProviderUpdateRequest {
+                provider: "openai".to_string(),
+                api_key: "sk-test".to_string(),
+                model: "openai/gpt-4o-mini".to_string(),
+            }),
+        )
+        .await
+        .expect("update provider");
+
+        assert!(response.0.success);
+
+        let config = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read config");
+        assert!(config.contains("secret:OPENAI_API_KEY"));
+        assert_eq!(
+            store.get("OPENAI_API_KEY").expect("secret stored").expose(),
+            "sk-test"
+        );
     }
 }

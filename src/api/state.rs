@@ -48,7 +48,7 @@ pub struct AgentInfo {
 /// State shared across all API handlers.
 pub struct ApiState {
     pub started_at: Instant,
-    pub auth_token: Option<String>,
+    pub auth_token: tokio::sync::RwLock<Option<String>>,
     /// Aggregated event stream from all agents. SSE clients subscribe here.
     pub event_tx: broadcast::Sender<ApiEvent>,
     /// Per-agent SQLite pools for querying channel/conversation data.
@@ -290,7 +290,7 @@ impl ApiState {
         let (event_tx, _) = broadcast::channel(512);
         Self {
             started_at: Instant::now(),
-            auth_token: None,
+            auth_token: tokio::sync::RwLock::new(None),
             event_tx,
             agent_pools: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             agent_configs: arc_swap::ArcSwap::from_pointee(Vec::new()),
@@ -790,6 +790,11 @@ impl ApiState {
     /// Share the messaging manager for runtime adapter addition from API handlers.
     pub async fn set_messaging_manager(&self, manager: Arc<MessagingManager>) {
         *self.messaging_manager.write().await = Some(manager);
+    }
+
+    /// Set the live API auth token used by the HTTP middleware.
+    pub async fn set_api_auth_token(&self, auth_token: Option<String>) {
+        *self.auth_token.write().await = auth_token;
     }
 
     /// Set the instance directory path.

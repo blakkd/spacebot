@@ -1,4 +1,8 @@
+use super::admin::{
+    load_config_doc, reload_runtime_configs, secret_reference, secrets_store, write_config_doc,
+};
 use super::state::ApiState;
+use crate::config::{DiscordConfig, EmailConfig, SlackConfig, TelegramConfig, TwitchConfig};
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -199,26 +203,8 @@ pub(super) async fn create_binding(
     State(state): State<Arc<ApiState>>,
     axum::Json(request): axum::Json<CreateBindingRequest>,
 ) -> Result<Json<CreateBindingResponse>, StatusCode> {
-    let config_path = state.config_path.read().await.clone();
-    if config_path.as_os_str().is_empty() {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    let content = if config_path.exists() {
-        tokio::fs::read_to_string(&config_path)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "failed to read config.toml");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-    } else {
-        String::new()
-    };
-
-    let mut doc: toml_edit::DocumentMut = content.parse().map_err(|error| {
-        tracing::warn!(%error, "failed to parse config.toml");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let store = secrets_store(&state)?;
+    let (_config_guard, config_path, mut doc) = load_config_doc(&state).await?;
 
     let mut new_discord_token: Option<String> = None;
     let mut new_slack_tokens: Option<(String, String)> = None;
@@ -243,7 +229,9 @@ pub(super) async fn create_binding(
                 .as_table_mut()
                 .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
             discord["enabled"] = toml_edit::value(true);
-            discord["token"] = toml_edit::value(token.as_str());
+            discord["token"] = toml_edit::value(secret_reference::<DiscordConfig>(
+                &store, "token", None, token,
+            )?);
             new_discord_token = Some(token.clone());
         }
         if let Some(bot_token) = &credentials.slack_bot_token {
@@ -262,8 +250,18 @@ pub(super) async fn create_binding(
                     .as_table_mut()
                     .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
                 slack["enabled"] = toml_edit::value(true);
-                slack["bot_token"] = toml_edit::value(bot_token.as_str());
-                slack["app_token"] = toml_edit::value(app_token);
+                slack["bot_token"] = toml_edit::value(secret_reference::<SlackConfig>(
+                    &store,
+                    "bot_token",
+                    None,
+                    bot_token,
+                )?);
+                slack["app_token"] = toml_edit::value(secret_reference::<SlackConfig>(
+                    &store,
+                    "app_token",
+                    None,
+                    app_token,
+                )?);
                 new_slack_tokens = Some((bot_token.clone(), app_token.to_string()));
             }
         }
@@ -283,7 +281,9 @@ pub(super) async fn create_binding(
                 .as_table_mut()
                 .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
             telegram["enabled"] = toml_edit::value(true);
-            telegram["token"] = toml_edit::value(token.as_str());
+            telegram["token"] = toml_edit::value(secret_reference::<TelegramConfig>(
+                &store, "token", None, token,
+            )?);
             new_telegram_token = Some(token.clone());
         }
 
@@ -352,13 +352,33 @@ pub(super) async fn create_binding(
             email["imap_host"] = toml_edit::value(email_imap_host);
             email["imap_port"] =
                 toml_edit::value(i64::from(credentials.email_imap_port.unwrap_or(993)));
-            email["imap_username"] = toml_edit::value(email_imap_username);
-            email["imap_password"] = toml_edit::value(email_imap_password);
+            email["imap_username"] = toml_edit::value(secret_reference::<EmailConfig>(
+                &store,
+                "imap_username",
+                None,
+                &email_imap_username,
+            )?);
+            email["imap_password"] = toml_edit::value(secret_reference::<EmailConfig>(
+                &store,
+                "imap_password",
+                None,
+                &email_imap_password,
+            )?);
             email["smtp_host"] = toml_edit::value(email_smtp_host);
             email["smtp_port"] =
                 toml_edit::value(i64::from(credentials.email_smtp_port.unwrap_or(587)));
-            email["smtp_username"] = toml_edit::value(email_smtp_username);
-            email["smtp_password"] = toml_edit::value(email_smtp_password);
+            email["smtp_username"] = toml_edit::value(secret_reference::<EmailConfig>(
+                &store,
+                "smtp_username",
+                None,
+                &email_smtp_username,
+            )?);
+            email["smtp_password"] = toml_edit::value(secret_reference::<EmailConfig>(
+                &store,
+                "smtp_password",
+                None,
+                &email_smtp_password,
+            )?);
             email["from_address"] = toml_edit::value(email_from_address);
 
             if let Some(from_name) = &credentials.email_from_name {
@@ -391,15 +411,35 @@ pub(super) async fn create_binding(
                     .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
                 twitch["enabled"] = toml_edit::value(true);
                 twitch["username"] = toml_edit::value(username.as_str());
-                twitch["oauth_token"] = toml_edit::value(oauth_token);
+                twitch["oauth_token"] = toml_edit::value(secret_reference::<TwitchConfig>(
+                    &store,
+                    "oauth_token",
+                    None,
+                    oauth_token,
+                )?);
                 if !client_id.is_empty() {
-                    twitch["client_id"] = toml_edit::value(client_id);
+                    twitch["client_id"] = toml_edit::value(secret_reference::<TwitchConfig>(
+                        &store,
+                        "client_id",
+                        None,
+                        client_id,
+                    )?);
                 }
                 if !client_secret.is_empty() {
-                    twitch["client_secret"] = toml_edit::value(client_secret);
+                    twitch["client_secret"] = toml_edit::value(secret_reference::<TwitchConfig>(
+                        &store,
+                        "client_secret",
+                        None,
+                        client_secret,
+                    )?);
                 }
                 if !refresh_token.is_empty() {
-                    twitch["refresh_token"] = toml_edit::value(refresh_token);
+                    twitch["refresh_token"] = toml_edit::value(secret_reference::<TwitchConfig>(
+                        &store,
+                        "refresh_token",
+                        None,
+                        refresh_token,
+                    )?);
                 }
                 new_twitch_creds = Some((username.clone(), oauth_token.to_string()));
             }
@@ -452,12 +492,7 @@ pub(super) async fn create_binding(
     }
     bindings_array.push(binding_table);
 
-    tokio::fs::write(&config_path, doc.to_string())
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "failed to write config.toml");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    write_config_doc(&config_path, &doc).await?;
 
     tracing::info!(
         agent_id = %request.agent_id,
@@ -465,7 +500,7 @@ pub(super) async fn create_binding(
         "binding created via API"
     );
 
-    if let Ok(new_config) = crate::config::Config::load_from_path(&config_path) {
+    if let Ok(new_config) = reload_runtime_configs(&state, &config_path).await {
         let bindings_guard = state.bindings.read().await;
         if let Some(bindings_swap) = bindings_guard.as_ref() {
             bindings_swap.store(std::sync::Arc::new(new_config.bindings.clone()));
@@ -980,4 +1015,98 @@ pub(super) async fn delete_binding(
         success: true,
         message: "Binding deleted.".to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CreateBindingRequest, PlatformCredentials, create_binding};
+    use crate::api::ApiState;
+    use axum::extract::State;
+    use std::sync::Arc;
+
+    fn test_api_state() -> Arc<ApiState> {
+        let (provider_setup_tx, _provider_setup_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_tx, _agent_rx) = tokio::sync::mpsc::channel(1);
+        let (agent_remove_tx, _agent_remove_rx) = tokio::sync::mpsc::channel(1);
+        let (injection_tx, _injection_rx) = tokio::sync::mpsc::channel(1);
+        let task_store_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        ));
+
+        Arc::new(ApiState::new_with_provider_sender(
+            provider_setup_tx,
+            agent_tx,
+            agent_remove_tx,
+            injection_tx,
+            task_store_registry,
+        ))
+    }
+
+    #[tokio::test]
+    async fn create_binding_moves_platform_credentials_into_secret_store() {
+        let state = test_api_state();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        tokio::fs::write(&config_path, "\n")
+            .await
+            .expect("write config");
+        *state.config_path.write().await = config_path.clone();
+
+        let secrets_path = tempdir.path().join("secrets.redb");
+        let store =
+            Arc::new(crate::secrets::store::SecretsStore::new(&secrets_path).expect("secrets"));
+        state.set_secrets_store(store.clone());
+
+        let response = create_binding(
+            State(state),
+            axum::Json(CreateBindingRequest {
+                agent_id: "alpha".to_string(),
+                channel: "discord".to_string(),
+                adapter: None,
+                guild_id: None,
+                workspace_id: None,
+                chat_id: None,
+                channel_ids: Vec::new(),
+                require_mention: false,
+                dm_allowed_users: Vec::new(),
+                platform_credentials: Some(PlatformCredentials {
+                    discord_token: Some("discord-secret".to_string()),
+                    slack_bot_token: None,
+                    slack_app_token: None,
+                    telegram_token: None,
+                    email_imap_host: None,
+                    email_imap_port: None,
+                    email_imap_username: None,
+                    email_imap_password: None,
+                    email_smtp_host: None,
+                    email_smtp_port: None,
+                    email_smtp_username: None,
+                    email_smtp_password: None,
+                    email_from_address: None,
+                    email_from_name: None,
+                    twitch_username: None,
+                    twitch_oauth_token: None,
+                    twitch_client_id: None,
+                    twitch_client_secret: None,
+                    twitch_refresh_token: None,
+                }),
+            }),
+        )
+        .await
+        .expect("create binding");
+
+        assert!(response.0.success);
+
+        let config = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read config");
+        assert!(config.contains("secret:DISCORD_BOT_TOKEN"));
+        assert_eq!(
+            store
+                .get("DISCORD_BOT_TOKEN")
+                .expect("secret stored")
+                .expose(),
+            "discord-secret"
+        );
+    }
 }
