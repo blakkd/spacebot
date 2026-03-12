@@ -381,8 +381,7 @@ fn parse_implicit_signal_shorthand(
     }
 
     // Starts with + but doesn't meet phone number requirements.
-    if trimmed.starts_with('+') {
-        let digits = &trimmed[1..];
+    if let Some(digits) = trimmed.strip_prefix('+') {
         if digits.chars().all(|c| c.is_ascii_digit()) {
             return Err(format!(
                 "'{trimmed}' looks like a phone number but is too short. Phone numbers need at least 7 digits after the + prefix."
@@ -396,8 +395,7 @@ fn parse_implicit_signal_shorthand(
     }
 
     // Group ID format: group:xxx
-    if trimmed.starts_with("group:") {
-        let group_id = &trimmed["group:".len()..];
+    if let Some(group_id) = trimmed.strip_prefix("group:") {
         if group_id.is_empty() {
             return Err("group: prefix requires an ID. Use format: group:<group_id>".to_string());
         }

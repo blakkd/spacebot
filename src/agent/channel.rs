@@ -34,6 +34,10 @@ use std::sync::{Arc, Weak};
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, mpsc};
 
+/// Shared cache of in-flight worker transcript steps, keyed by worker ID.
+pub type LiveWorkerTranscripts =
+    Arc<RwLock<HashMap<String, Vec<crate::conversation::worker_transcript::TranscriptStep>>>>;
+
 /// A background process result waiting to be relayed to the user via retrigger.
 ///
 /// Instead of injecting raw result text into history as a fake "User" message
@@ -119,8 +123,7 @@ pub struct ChannelState {
     /// This Arc is shared with `ApiState` — the event loop populates it from
     /// `ToolStarted`/`ToolCompleted` events as they flow through the system.
     /// Defaults to a standalone empty map when the API layer is not active.
-    pub live_worker_transcripts:
-        Arc<RwLock<HashMap<String, Vec<crate::conversation::worker_transcript::TranscriptStep>>>>,
+    pub live_worker_transcripts: LiveWorkerTranscripts,
 }
 
 impl ChannelState {
@@ -478,6 +481,7 @@ impl Channel {
     /// All tunable config (prompts, routing, thresholds, browser, skills) is read
     /// from `deps.runtime_config` on each use, so changes propagate to running
     /// channels without restart.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
         deps: AgentDeps,
@@ -486,13 +490,7 @@ impl Channel {
         screenshot_dir: std::path::PathBuf,
         logs_dir: std::path::PathBuf,
         prompt_snapshot_store: Option<Arc<crate::agent::prompt_snapshot::PromptSnapshotStore>>,
-        live_worker_transcripts: Option<
-            Arc<
-                RwLock<
-                    HashMap<String, Vec<crate::conversation::worker_transcript::TranscriptStep>>,
-                >,
-            >,
-        >,
+        live_worker_transcripts: Option<LiveWorkerTranscripts>,
     ) -> (Self, mpsc::Sender<InboundMessage>) {
         let process_id = ProcessId::Channel(id.clone());
         let hook = SpacebotHook::new(
