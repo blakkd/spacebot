@@ -480,7 +480,9 @@ impl Messaging for MattermostAdapter {
                             tokio::select! {
                                 _ = shutdown_rx.recv() => {
                                     tracing::info!(adapter = %runtime_key, "mattermost websocket shutting down");
-                                    let _ = write.send(WsMessage::Close(None)).await;
+                                    if let Err(error) = write.send(WsMessage::Close(None)).await {
+                                        tracing::debug!(%error, "failed to send websocket close frame");
+                                    }
                                     return;
                                 }
 
@@ -660,28 +662,33 @@ impl Messaging for MattermostAdapter {
             }
 
             OutboundResponse::StreamChunk(chunk) => {
-                let mut active_messages = self.active_messages.write().await;
-                if let Some(active) = active_messages.get_mut(&message.id) {
-                    active.accumulated_text.push_str(&chunk);
+                let pending_edit = {
+                    let mut active_messages = self.active_messages.write().await;
+                    if let Some(active) = active_messages.get_mut(&message.id) {
+                        active.accumulated_text.push_str(&chunk);
 
-                    if active.last_edit.elapsed() > STREAM_EDIT_THROTTLE {
-                        let display_text: std::borrow::Cow<'_, str> =
-                            if active.accumulated_text.len() > MAX_MESSAGE_LENGTH {
+                        if active.last_edit.elapsed() > STREAM_EDIT_THROTTLE {
+                            let display_text = if active.accumulated_text.len() > MAX_MESSAGE_LENGTH
+                            {
                                 let end = active
                                     .accumulated_text
                                     .floor_char_boundary(MAX_MESSAGE_LENGTH - 3);
-                                std::borrow::Cow::Owned(format!(
-                                    "{}...",
-                                    &active.accumulated_text[..end]
-                                ))
+                                format!("{}...", &active.accumulated_text[..end])
                             } else {
-                                std::borrow::Cow::Borrowed(active.accumulated_text.as_str())
+                                active.accumulated_text.clone()
                             };
-
-                        if let Err(error) = self.edit_post(&active.post_id, display_text.as_ref()).await {
-                            tracing::warn!(%error, "failed to edit streaming message");
+                            active.last_edit = Instant::now();
+                            Some((active.post_id.clone(), display_text))
+                        } else {
+                            None
                         }
-                        active.last_edit = Instant::now();
+                    } else {
+                        None
+                    }
+                };
+                if let Some((post_id, display_text)) = pending_edit {
+                    if let Err(error) = self.edit_post(&post_id, &display_text).await {
+                        tracing::warn!(%error, "failed to edit streaming message");
                     }
                 }
             }
@@ -1054,12 +1061,13 @@ fn build_message_from_post(
     }
 
     if !permissions.channel_filter.is_empty() {
-        // Fail-closed: no team_id → can't look up allowed channels → reject.
+        // Fail-closed: no team_id or no allowlist entry for this team → reject.
         let Some(tid) = team_id else { return None };
-        if let Some(allowed_channels) = permissions.channel_filter.get(tid) {
-            if !allowed_channels.contains(&post.channel_id) {
-                return None;
-            }
+        let Some(allowed_channels) = permissions.channel_filter.get(tid) else {
+            return None;
+        };
+        if !allowed_channels.contains(&post.channel_id) {
+            return None;
         }
     }
 

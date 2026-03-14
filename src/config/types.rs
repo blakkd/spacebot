@@ -1919,7 +1919,22 @@ fn validate_mattermost_url(url: &str) -> Result<()> {
     match parsed.scheme() {
         "https" => {}
         "http" => {
-            tracing::warn!(url, "mattermost base_url uses http instead of https");
+            let is_local = match parsed.host() {
+                Some(url::Host::Domain(h)) => h.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(addr)) => addr == std::net::Ipv4Addr::LOCALHOST,
+                Some(url::Host::Ipv6(addr)) => addr == std::net::Ipv6Addr::LOCALHOST,
+                None => false,
+            };
+            if !is_local {
+                return Err(ConfigError::Invalid(
+                    "mattermost base_url must use https for non-localhost hosts".to_string(),
+                )
+                .into());
+            }
+            tracing::warn!(
+                host = parsed.host_str().unwrap_or("<unknown>"),
+                "mattermost base_url uses http for localhost"
+            );
         }
         scheme => {
             return Err(ConfigError::Invalid(format!(
@@ -2679,6 +2694,31 @@ pub struct MattermostInstanceConfig {
     pub max_attachment_bytes: usize,
 }
 
+impl SystemSecrets for MattermostConfig {
+    fn section() -> &'static str {
+        "mattermost"
+    }
+
+    fn is_messaging_adapter() -> bool {
+        true
+    }
+
+    fn secret_fields() -> &'static [SecretField] {
+        &[
+            SecretField {
+                toml_key: "token",
+                secret_name: "MATTERMOST_TOKEN",
+                instance_pattern: None,
+            },
+            SecretField {
+                toml_key: "base_url",
+                secret_name: "MATTERMOST_BASE_URL",
+                instance_pattern: None,
+            },
+        ]
+    }
+}
+
 impl std::fmt::Debug for MattermostInstanceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MattermostInstanceConfig")
@@ -2704,9 +2744,18 @@ mod mattermost_url_tests {
     }
 
     #[test]
-    fn accepts_http_url_with_warning() {
-        // http is allowed (with a warning), not an error
-        assert!(validate_mattermost_url("http://mattermost.example.com").is_ok());
+    fn accepts_http_localhost_with_warning() {
+        // http is allowed only for localhost (with a warning)
+        assert!(validate_mattermost_url("http://localhost:8065").is_ok());
+        assert!(validate_mattermost_url("http://127.0.0.1:8065").is_ok());
+        assert!(validate_mattermost_url("http://[::1]:8065").is_ok());
+    }
+
+    #[test]
+    fn rejects_http_non_localhost() {
+        // http is rejected for non-local hosts
+        assert!(validate_mattermost_url("http://mattermost.example.com").is_err());
+        assert!(validate_mattermost_url("http://10.0.0.1").is_err());
     }
 
     #[test]
@@ -2721,3 +2770,4 @@ mod mattermost_url_tests {
         assert!(validate_mattermost_url("").is_err());
     }
 }
+
