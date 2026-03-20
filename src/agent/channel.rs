@@ -19,6 +19,8 @@ use crate::conversation::{ChannelStore, ConversationLogger, ProcessRunLogger};
 use crate::error::{AgentError, Result};
 use crate::hooks::SpacebotHook;
 use crate::llm::SpacebotModel;
+use crate::memory::search::{SearchConfig, SearchMode, SearchSort};
+use crate::memory::types::MemoryType;
 use crate::{
     AgentDeps, BranchId, ChannelId, InboundMessage, OutboundResponse, ProcessEvent, ProcessId,
     ProcessType, RoutedResponse, RoutedSender, WorkerId,
@@ -59,6 +61,77 @@ struct PendingResult {
 
 const EVENT_LAG_WARNING_INTERVAL_SECS: u64 = 30;
 const MAX_RECENT_SPOKEN_RESPONSES: usize = 15;
+const MAX_LEARNED_IDENTITY_MEMORIES: usize = 5;
+
+pub(crate) async fn render_identity_context(
+    identity: &crate::identity::Identity,
+    memory_search: &crate::memory::MemorySearch,
+) -> String {
+    let learned_identity_memories = match memory_search
+        .search(
+            "",
+            &SearchConfig {
+                mode: SearchMode::Typed,
+                memory_type: Some(MemoryType::Identity),
+                sort_by: SearchSort::Importance,
+                max_results: MAX_LEARNED_IDENTITY_MEMORIES,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(results) => results
+            .into_iter()
+            .map(|result| result.memory.content.trim().to_string())
+            .filter(|content| !content.is_empty())
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to load learned identity memories");
+            Vec::new()
+        }
+    };
+
+    format_identity_context(identity, &learned_identity_memories)
+}
+
+fn format_identity_context(
+    identity: &crate::identity::Identity,
+    learned_identity_memories: &[String],
+) -> String {
+    let mut output = String::new();
+
+    if let Some(soul) = &identity.soul {
+        output.push_str("## Soul\n\n");
+        output.push_str(soul);
+        output.push_str("\n\n");
+    }
+
+    if identity.identity.is_some() || !learned_identity_memories.is_empty() {
+        output.push_str("## Identity\n\n");
+        if let Some(identity_text) = &identity.identity {
+            output.push_str(identity_text);
+            output.push_str("\n\n");
+        }
+
+        if !learned_identity_memories.is_empty() {
+            output.push_str("### Learned Identity Memories\n\n");
+            for memory in learned_identity_memories {
+                output.push_str("- ");
+                output.push_str(&memory.replace('\n', " "));
+                output.push('\n');
+            }
+            output.push('\n');
+        }
+    }
+
+    if let Some(role) = &identity.role {
+        output.push_str("## Role\n\n");
+        output.push_str(role);
+        output.push_str("\n\n");
+    }
+
+    output
+}
 
 fn load_recent_spoken_responses(
     settings: Option<&Arc<crate::settings::SettingsStore>>,
@@ -851,11 +924,13 @@ impl Channel {
     async fn send_routed(
         &self,
         response: OutboundResponse,
+        message_id: Option<String>,
     ) -> std::result::Result<(), mpsc::error::SendError<RoutedResponse>> {
         let routed = match &self.current_inbound {
             Some(target) => RoutedResponse {
                 response,
                 target: target.clone(),
+                message_id: message_id.clone(),
             },
             None => {
                 tracing::warn!(
@@ -865,6 +940,7 @@ impl Channel {
                 RoutedResponse {
                     response,
                     target: InboundMessage::empty(),
+                    message_id,
                 }
             }
         };
@@ -872,7 +948,10 @@ impl Channel {
     }
 
     async fn send_builtin_text(&mut self, text: String, log_label: &str) {
-        match self.send_routed(OutboundResponse::Text(text.clone())).await {
+        match self
+            .send_routed(OutboundResponse::Text(text.clone()), None)
+            .await
+        {
             Ok(()) => {
                 #[cfg(feature = "metrics")]
                 {
@@ -1563,7 +1642,9 @@ impl Channel {
         let rc = &self.deps.runtime_config;
         let prompt_engine = rc.prompts.load();
 
-        let identity_context = rc.identity.load().render();
+        let identity_snapshot = rc.identity.load().clone();
+        let identity_context =
+            render_identity_context(&identity_snapshot, &self.deps.memory_search).await;
         let memory_bulletin = rc.memory_bulletin.load();
         let skills = rc.skills.load();
         let skills_prompt = skills.render_channel_prompt(&prompt_engine)?;
@@ -2270,7 +2351,9 @@ impl Channel {
         let rc = &self.deps.runtime_config;
         let prompt_engine = rc.prompts.load();
 
-        let identity_context = rc.identity.load().render();
+        let identity_snapshot = rc.identity.load().clone();
+        let identity_context =
+            render_identity_context(&identity_snapshot, &self.deps.memory_search).await;
         let memory_bulletin = rc.memory_bulletin.load();
         let skills = rc.skills.load();
         let skills_prompt = skills.render_channel_prompt(&prompt_engine)?;
@@ -2451,9 +2534,12 @@ impl Channel {
             .tool_server_handle(self.tool_server.clone())
             .build();
 
-        self.send_routed(OutboundResponse::Status(crate::StatusUpdate::Thinking))
-            .await
-            .ok();
+        self.send_routed(
+            OutboundResponse::Status(crate::StatusUpdate::Thinking),
+            None,
+        )
+        .await
+        .ok();
 
         // Inject attachments as a user message before the text prompt
         if !attachment_content.is_empty() {
@@ -2662,8 +2748,16 @@ impl Channel {
     }
 
     /// Send outbound text and record send metrics.
-    async fn send_outbound_text(&self, text: String, error_context: &str) -> bool {
-        match self.send_routed(OutboundResponse::Text(text)).await {
+    async fn send_outbound_text(
+        &self,
+        text: String,
+        error_context: &str,
+        message_id: Option<String>,
+    ) -> bool {
+        match self
+            .send_routed(OutboundResponse::Text(text), message_id)
+            .await
+        {
             Ok(()) => {
                 #[cfg(feature = "metrics")]
                 {
@@ -2762,18 +2856,30 @@ impl Channel {
                                 if extracted.is_some() {
                                     tracing::warn!(channel_id = %self.id, "extracted reply from malformed tool syntax in retrigger fallback");
                                 }
+                                let message_id = uuid::Uuid::new_v4().to_string();
+                                let spoken_source_text = final_text.clone();
                                 self.state
                                     .conversation_logger
-                                    .log_bot_message(&self.state.channel_id, &final_text);
-                                let spoken_source_text = final_text.clone();
+                                    .log_bot_message_with_name_and_id(
+                                        &self.state.channel_id,
+                                        message_id.clone(),
+                                        &final_text,
+                                        Some(self.agent_display_name()),
+                                    );
                                 let sent = self
                                     .send_outbound_text(
                                         final_text,
                                         "failed to send retrigger fallback reply",
+                                        Some(message_id.clone()),
                                     )
                                     .await;
                                 if sent {
-                                    self.maybe_generate_spoken_response(spoken_source_text);
+                                    self.maybe_generate_spoken_response(
+                                        crate::tools::reply::RepliedMessage {
+                                            text: spoken_source_text,
+                                            message_id,
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -2832,18 +2938,30 @@ impl Channel {
                                 source,
                             );
                             if !final_text.is_empty() {
+                                let message_id = uuid::Uuid::new_v4().to_string();
+                                let spoken_source_text = final_text.clone();
                                 self.state
                                     .conversation_logger
-                                    .log_bot_message(&self.state.channel_id, &final_text);
-                                let spoken_source_text = final_text.clone();
+                                    .log_bot_message_with_name_and_id(
+                                        &self.state.channel_id,
+                                        message_id.clone(),
+                                        &final_text,
+                                        Some(self.agent_display_name()),
+                                    );
                                 let sent = self
                                     .send_outbound_text(
                                         final_text,
                                         "failed to send retrigger fallback reply",
+                                        Some(message_id.clone()),
                                     )
                                     .await;
                                 if sent {
-                                    self.maybe_generate_spoken_response(spoken_source_text);
+                                    self.maybe_generate_spoken_response(
+                                        crate::tools::reply::RepliedMessage {
+                                            text: spoken_source_text,
+                                            message_id,
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -2891,17 +3009,29 @@ impl Channel {
                             if extracted.is_some() {
                                 tracing::warn!(channel_id = %self.id, "extracted reply from malformed tool syntax in LLM text output");
                             }
-                            self.state.conversation_logger.log_bot_message_with_name(
-                                &self.state.channel_id,
-                                &final_text,
-                                Some(self.agent_display_name()),
-                            );
-                            let spoken_source_text = final_text.clone();
+                            let message_id = uuid::Uuid::new_v4().to_string();
+                            self.state
+                                .conversation_logger
+                                .log_bot_message_with_name_and_id(
+                                    &self.state.channel_id,
+                                    message_id.clone(),
+                                    &final_text,
+                                    Some(self.agent_display_name()),
+                                );
                             let sent = self
-                                .send_outbound_text(final_text, "failed to send fallback reply")
+                                .send_outbound_text(
+                                    final_text.clone(),
+                                    "failed to send fallback reply",
+                                    Some(message_id.clone()),
+                                )
                                 .await;
                             if sent {
-                                self.maybe_generate_spoken_response(spoken_source_text);
+                                self.maybe_generate_spoken_response(
+                                    crate::tools::reply::RepliedMessage {
+                                        text: final_text,
+                                        message_id,
+                                    },
+                                );
                             }
                         }
                     }
@@ -2939,7 +3069,7 @@ impl Channel {
                     .inc();
                 // Send error to user so they know something went wrong
                 let error_msg = format!("I encountered an error: {}", error);
-                self.send_routed(OutboundResponse::Text(error_msg))
+                self.send_routed(OutboundResponse::Text(error_msg), None)
                     .await
                     .ok();
                 tracing::error!(channel_id = %self.id, %error, "channel LLM call failed");
@@ -2947,9 +3077,12 @@ impl Channel {
         }
 
         // Ensure typing indicator is always cleaned up, even on error paths
-        self.send_routed(OutboundResponse::Status(crate::StatusUpdate::StopTyping))
-            .await
-            .ok();
+        self.send_routed(
+            OutboundResponse::Status(crate::StatusUpdate::StopTyping),
+            None,
+        )
+        .await
+        .ok();
     }
 
     /// Handle a process event (branch results, worker completions, status updates).
@@ -3750,9 +3883,11 @@ openings and rhythm from reply to reply.";
 mod tests {
     use super::{
         QuietModeFallbackState, build_spoken_generation_prompt, compute_listen_mode_invocation,
-        load_recent_spoken_responses, recv_channel_event, should_process_event_for_channel,
-        should_send_discord_quiet_mode_ping_ack, should_send_quiet_mode_fallback,
+        format_identity_context, load_recent_spoken_responses, recv_channel_event,
+        should_process_event_for_channel, should_send_discord_quiet_mode_ping_ack,
+        should_send_quiet_mode_fallback,
     };
+    use crate::identity::Identity;
     use crate::memory::MemoryType;
     use crate::settings::SettingsStore;
     use crate::{AgentId, ChannelId, InboundMessage, MessageContent, ProcessEvent, ProcessId};
@@ -3820,6 +3955,31 @@ mod tests {
             history.into_iter().collect::<Vec<_>>(),
             vec!["One", "Two", "Three"]
         );
+    }
+
+    #[test]
+    fn identity_context_merges_learned_identity_memories_into_identity_section() {
+        let identity = Identity {
+            soul: Some("Core values".into()),
+            identity: Some("Static identity".into()),
+            role: Some("Do the work".into()),
+            speech: None,
+        };
+
+        let rendered = format_identity_context(
+            &identity,
+            &[
+                "Jamie has chosen Star as my name.".into(),
+                "I should use Star consistently across channels.".into(),
+            ],
+        );
+
+        assert!(
+            rendered.contains("## Identity\n\nStatic identity\n\n### Learned Identity Memories")
+        );
+        assert!(rendered.contains("- Jamie has chosen Star as my name."));
+        assert!(rendered.contains("- I should use Star consistently across channels."));
+        assert!(rendered.contains("## Role\n\nDo the work"));
     }
 
     #[tokio::test]
