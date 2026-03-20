@@ -22,7 +22,7 @@ pub struct RuntimeConfig {
     /// Agent workspace directory (e.g., ~/.spacebot/agents/{id}/workspace). Immutable after startup.
     pub workspace_dir: PathBuf,
     /// Agent identity directory (e.g., ~/.spacebot/agents/{id}/). Identity
-    /// files (SOUL.md, IDENTITY.md, ROLE.md) live here, outside the workspace
+    /// files (SOUL.md, IDENTITY.md, ROLE.md, SPEECH.md) live here, outside the workspace
     /// sandbox boundary. Immutable after startup.
     pub identity_dir: PathBuf,
     pub routing: ArcSwap<RoutingConfig>,

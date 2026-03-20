@@ -57,6 +57,7 @@ fn toggle_overlay(app: &tauri::AppHandle) {
         if overlay.is_visible().unwrap_or(false) {
             let _ = overlay.hide();
         } else {
+            apply_overlay_window_chrome(&overlay);
             let _ = overlay.show();
             let _ = overlay.set_focus();
         }
@@ -68,6 +69,7 @@ fn toggle_overlay(app: &tauri::AppHandle) {
 
 fn create_overlay_window(app: &tauri::AppHandle) {
     use tauri::WebviewWindowBuilder;
+    use tauri::window::Color;
 
     // Get the primary monitor to position at bottom center
     let monitor = app.primary_monitor().ok().flatten();
@@ -95,15 +97,21 @@ fn create_overlay_window(app: &tauri::AppHandle) {
     .inner_size(overlay_width, overlay_height)
     .position(x, y)
     .decorations(false)
+    .shadow(false)
     .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
     .always_on_top(true)
     .visible(true)
     .resizable(false)
     .skip_taskbar(true)
     .focused(true)
+    .maximizable(false)
+    .minimizable(false)
+    .closable(false)
     .build()
     {
         Ok(window) => {
+            apply_overlay_window_chrome(&window);
             tracing::info!("voice overlay window created");
             // Apply dark theme on macOS
             #[cfg(target_os = "macos")]
@@ -120,6 +128,12 @@ fn create_overlay_window(app: &tauri::AppHandle) {
             tracing::error!(%error, "failed to create voice overlay window");
         }
     }
+}
+
+fn apply_overlay_window_chrome(window: &tauri::WebviewWindow) {
+    let _ = window.set_decorations(false);
+    let _ = window.set_shadow(false);
+    let _ = window.set_always_on_top(true);
 }
 
 fn main() {

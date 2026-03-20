@@ -30,6 +30,7 @@ use rig::one_or_many::OneOrMany;
 use rig::tool::server::ToolServer;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, mpsc};
@@ -57,6 +58,58 @@ struct PendingResult {
 }
 
 const EVENT_LAG_WARNING_INTERVAL_SECS: u64 = 30;
+const MAX_RECENT_SPOKEN_RESPONSES: usize = 15;
+
+fn load_recent_spoken_responses(
+    settings: Option<&Arc<crate::settings::SettingsStore>>,
+    channel_id: &ChannelId,
+) -> VecDeque<String> {
+    let Some(settings) = settings else {
+        return VecDeque::new();
+    };
+
+    match settings.channel_spoken_history_for(channel_id.as_ref()) {
+        Ok(history) => history
+            .into_iter()
+            .rev()
+            .take(MAX_RECENT_SPOKEN_RESPONSES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect(),
+        Err(error) => {
+            tracing::warn!(channel_id = %channel_id, %error, "failed to load spoken response history");
+            VecDeque::new()
+        }
+    }
+}
+
+fn build_spoken_generation_prompt(
+    full_text: &str,
+    speech_guidance: &str,
+    recent_spoken_responses: &[String],
+) -> String {
+    let recent_spoken_history = if recent_spoken_responses.is_empty() {
+        "None".to_string()
+    } else {
+        recent_spoken_responses
+            .iter()
+            .enumerate()
+            .map(|(index, response)| format!("{}. {}", index + 1, response))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let speech_guidance_section = if speech_guidance.trim().is_empty() {
+        "None".to_string()
+    } else {
+        speech_guidance.trim().to_string()
+    };
+
+    format!(
+        "Speech personality guidance:\n{speech_guidance_section}\n\nRecent spoken responses to avoid repeating:\n{recent_spoken_history}\n\nFull response to summarize for speech:\n\n{full_text}"
+    )
+}
 
 async fn recv_channel_event(
     event_rx: &mut broadcast::Receiver<ProcessEvent>,
@@ -455,6 +508,8 @@ pub struct Channel {
     listen_only_session_override: Option<bool>,
     /// Handle exposed to the supervision control plane.
     control_handle: ChannelControlHandle,
+    /// Recent spoken-response rewrites used to avoid repetitive voice openings.
+    recent_spoken_responses: Arc<RwLock<VecDeque<String>>>,
 }
 
 /// RAII guard that records `message_handling_duration_seconds` when dropped,
@@ -560,6 +615,10 @@ impl Channel {
         let self_tx = message_tx.clone();
         let resolved_listen_only_mode = deps.runtime_config.channel_config.load().listen_only_mode;
         let control_handle = ChannelControlHandle::new(state.clone());
+        let recent_spoken_responses = Arc::new(RwLock::new(load_recent_spoken_responses(
+            deps.runtime_config.settings.load().as_ref().as_ref(),
+            &id,
+        )));
         let channel = Self {
             id: id.clone(),
             title: None,
@@ -592,6 +651,7 @@ impl Channel {
             listen_only_mode: resolved_listen_only_mode,
             listen_only_session_override: None,
             control_handle,
+            recent_spoken_responses,
         };
 
         (channel, message_tx)
@@ -1475,10 +1535,10 @@ impl Channel {
 
         // Generate spoken response for voice-enabled channels (batched path).
         let replied = replied_flag.load(std::sync::atomic::Ordering::Relaxed);
-        if replied {
-            if let Some(full_text) = replied_text.lock().ok().and_then(|mut slot| slot.take()) {
-                self.maybe_generate_spoken_response(full_text);
-            }
+        if replied
+            && let Some(full_text) = replied_text.lock().ok().and_then(|mut slot| slot.take())
+        {
+            self.maybe_generate_spoken_response(full_text);
         }
 
         // Check compaction
@@ -1854,10 +1914,10 @@ impl Channel {
         // If the reply tool was used and we have a voice model configured,
         // generate a spoken response in the background (fire-and-forget).
         let replied = replied_flag.load(std::sync::atomic::Ordering::Relaxed);
-        if replied {
-            if let Some(full_text) = replied_text.lock().ok().and_then(|mut slot| slot.take()) {
-                self.maybe_generate_spoken_response(full_text);
-            }
+        if replied
+            && let Some(full_text) = replied_text.lock().ok().and_then(|mut slot| slot.take())
+        {
+            self.maybe_generate_spoken_response(full_text);
         }
 
         // Safety-net: in quiet mode, explicit mention/reply should never be dropped silently.
@@ -2510,14 +2570,65 @@ impl Channel {
         let channel_id = self.state.channel_id.clone();
         let event_tx = self.deps.event_tx.clone();
         let llm_manager = self.deps.llm_manager.clone();
+        let speech_guidance = rc.identity.load().render_speech();
+        let recent_spoken_responses = self.recent_spoken_responses.clone();
+        let settings_store = rc.settings.load().as_ref().as_ref().cloned();
         let routing = rc.routing.load();
         // Use the channel model for the spoken summary LLM call. A fast model
         // is ideal but we fall back to whatever the channel is configured with.
         let model_name = routing.channel.clone();
 
         tokio::spawn(async move {
-            match generate_spoken_text(&llm_manager, &model_name, &full_text).await {
+            let recent_spoken_snapshot: Vec<String> = recent_spoken_responses
+                .read()
+                .await
+                .iter()
+                .cloned()
+                .collect();
+            tracing::debug!(
+                %agent_id,
+                %channel_id,
+                recent_spoken_count = recent_spoken_snapshot.len(),
+                "starting spoken response generation"
+            );
+
+            match generate_spoken_text(
+                &llm_manager,
+                &model_name,
+                &full_text,
+                &speech_guidance,
+                &recent_spoken_snapshot,
+            )
+            .await
+            {
                 Ok(spoken_text) => {
+                    let persisted_history = {
+                        let mut history = recent_spoken_responses.write().await;
+                        history.push_back(spoken_text.clone());
+                        while history.len() > MAX_RECENT_SPOKEN_RESPONSES {
+                            history.pop_front();
+                        }
+                        history.iter().cloned().collect::<Vec<_>>()
+                    };
+
+                    if let Some(settings_store) = settings_store.as_ref()
+                        && let Err(error) = settings_store
+                            .set_channel_spoken_history_for(channel_id.as_ref(), &persisted_history)
+                    {
+                        tracing::warn!(
+                            %agent_id,
+                            %channel_id,
+                            %error,
+                            "failed to persist spoken response history"
+                        );
+                    }
+
+                    tracing::debug!(
+                        %agent_id,
+                        %channel_id,
+                        recent_spoken_count = persisted_history.len(),
+                        "updated spoken response history"
+                    );
                     tracing::debug!(
                         %agent_id,
                         %channel_id,
@@ -3587,6 +3698,8 @@ async fn generate_spoken_text(
     llm_manager: &std::sync::Arc<crate::llm::LlmManager>,
     model_name: &str,
     full_text: &str,
+    speech_guidance: &str,
+    recent_spoken_responses: &[String],
 ) -> Result<String> {
     use rig::agent::AgentBuilder;
     use rig::completion::{CompletionModel, Prompt};
@@ -3600,22 +3713,25 @@ async fn generate_spoken_text(
 
     let system = "\
 You are generating a spoken voice reply. Rewrite the following assistant response \
-as a brief, natural spoken reply (1-3 sentences max). Be conversational, warm, and \
-direct. No markdown, no code, no bullet points, no lists. Just speak naturally as \
+as a brief, natural spoken reply (1-3 sentences max). Be conversational, warm, direct, \
+and varied. No markdown, no code, no bullet points, no lists. Just speak naturally as \
 if you were talking to a friend. If the response contains code or technical details, \
-summarize what was done at a high level without any code syntax.";
+summarize what was done at a high level without any code syntax. Avoid repetitive \
+openings like \"Perfect\", \"You're absolutely right\", \"Absolutely\", or \
+other canned affirmations unless the content truly requires them. Vary sentence \
+openings and rhythm from reply to reply.";
 
     let model = crate::llm::model::SpacebotModel::make(llm_manager, model_name);
     let agent = AgentBuilder::new(model).preamble(system).build();
-    let prompt = format!("Full response to summarize for speech:\n\n{input}");
+    let prompt = build_spoken_generation_prompt(input, speech_guidance, recent_spoken_responses);
 
     match agent.prompt(&prompt).await {
         Ok(spoken) => {
             let spoken = spoken.trim().to_string();
             if spoken.is_empty() {
-                Err(crate::error::AgentError::Other(
-                    anyhow::anyhow!("spoken response model returned empty output").into(),
-                )
+                Err(crate::error::AgentError::Other(anyhow::anyhow!(
+                    "spoken response model returned empty output"
+                ))
                 .into())
             } else {
                 Ok(spoken)
@@ -3628,11 +3744,12 @@ summarize what was done at a high level without any code syntax.";
 #[cfg(test)]
 mod tests {
     use super::{
-        QuietModeFallbackState, compute_listen_mode_invocation, recv_channel_event,
-        should_process_event_for_channel, should_send_discord_quiet_mode_ping_ack,
-        should_send_quiet_mode_fallback,
+        QuietModeFallbackState, build_spoken_generation_prompt, compute_listen_mode_invocation,
+        load_recent_spoken_responses, recv_channel_event, should_process_event_for_channel,
+        should_send_discord_quiet_mode_ping_ack, should_send_quiet_mode_fallback,
     };
     use crate::memory::MemoryType;
+    use crate::settings::SettingsStore;
     use crate::{AgentId, ChannelId, InboundMessage, MessageContent, ProcessEvent, ProcessId};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3659,6 +3776,45 @@ mod tests {
             metadata: message_metadata,
             formatted_author: None,
         }
+    }
+
+    #[test]
+    fn spoken_generation_prompt_includes_recent_history() {
+        let prompt = build_spoken_generation_prompt(
+            "Here is the full assistant response.",
+            "Be measured and varied.",
+            &["First reply".into(), "Second reply".into()],
+        );
+
+        assert!(prompt.contains("Speech personality guidance:\nBe measured and varied."));
+        assert!(prompt.contains(
+            "Recent spoken responses to avoid repeating:\n1. First reply\n2. Second reply"
+        ));
+        assert!(prompt.contains(
+            "Full response to summarize for speech:\n\nHere is the full assistant response."
+        ));
+    }
+
+    #[test]
+    fn spoken_generation_history_loads_from_settings_store() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let settings = Arc::new(
+            SettingsStore::new(&temp_dir.path().join("settings.redb"))
+                .expect("failed to create settings store"),
+        );
+        settings
+            .set_channel_spoken_history_for(
+                "portal:chat:main",
+                &["One".into(), "Two".into(), "Three".into()],
+            )
+            .expect("failed to persist spoken history");
+
+        let history = load_recent_spoken_responses(Some(&settings), &Arc::from("portal:chat:main"));
+
+        assert_eq!(
+            history.into_iter().collect::<Vec<_>>(),
+            vec!["One", "Two", "Three"]
+        );
     }
 
     #[tokio::test]

@@ -682,6 +682,7 @@ export interface IdentityFiles {
 	soul: string | null;
 	identity: string | null;
 	role: string | null;
+	speech: string | null;
 }
 
 export interface IdentityUpdateRequest {
@@ -689,6 +690,7 @@ export interface IdentityUpdateRequest {
 	soul?: string | null;
 	identity?: string | null;
 	role?: string | null;
+	speech?: string | null;
 }
 
 // -- Agent Config Types --
