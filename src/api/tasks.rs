@@ -90,12 +90,21 @@ fn default_task_limit() -> i64 {
     20
 }
 
+/// Extract the global task store, returning 503 if not yet initialized.
+fn get_task_store(state: &ApiState) -> Result<Arc<crate::tasks::TaskStore>, StatusCode> {
+    state
+        .task_store
+        .load()
+        .as_ref()
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 pub(super) async fn list_tasks(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TaskListQuery>,
 ) -> Result<Json<TaskListResponse>, StatusCode> {
-    let stores = state.task_stores.load();
-    let store = stores.get(&query.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let store = get_task_store(&state)?;
 
     let status = match query.status.as_deref() {
         None => None,
@@ -130,8 +139,7 @@ pub(super) async fn get_task(
     Path(number): Path<i64>,
     Query(query): Query<TaskGetQuery>,
 ) -> Result<Json<TaskResponse>, StatusCode> {
-    let stores = state.task_stores.load();
-    let store = stores.get(&query.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let store = get_task_store(&state)?;
 
     let task = store
         .get_by_number(number)
@@ -149,8 +157,7 @@ pub(super) async fn create_task(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Result<Json<TaskResponse>, StatusCode> {
-    let stores = state.task_stores.load();
-    let store = stores.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let store = get_task_store(&state)?;
 
     let status = match request.status.as_deref() {
         None => crate::tasks::TaskStatus::Backlog,
@@ -198,8 +205,7 @@ pub(super) async fn update_task(
     Path(number): Path<i64>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> Result<Json<TaskResponse>, StatusCode> {
-    let stores = state.task_stores.load();
-    let store = stores.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let store = get_task_store(&state)?;
 
     let status = match request.status.as_deref() {
         None => None,
@@ -254,8 +260,7 @@ pub(super) async fn delete_task(
     Path(number): Path<i64>,
     Query(query): Query<DeleteTaskQuery>,
 ) -> Result<Json<TaskActionResponse>, StatusCode> {
-    let stores = state.task_stores.load();
-    let store = stores.get(&query.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let store = get_task_store(&state)?;
 
     let deleted = store
         .delete(number)
@@ -290,8 +295,7 @@ pub(super) async fn approve_task(
     Path(number): Path<i64>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> Result<Json<TaskResponse>, StatusCode> {
-    let stores = state.task_stores.load();
-    let store = stores.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let store = get_task_store(&state)?;
 
     let task = store
         .update(
@@ -329,8 +333,7 @@ pub(super) async fn execute_task(
     Path(number): Path<i64>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> Result<Json<TaskResponse>, StatusCode> {
-    let stores = state.task_stores.load();
-    let store = stores.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
+    let store = get_task_store(&state)?;
 
     // Fetch current task to check if transition is needed.
     let current = store
